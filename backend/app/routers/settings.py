@@ -33,9 +33,10 @@ async def get_settings(db: AsyncSession = Depends(get_db)):
         "default_audience": "intermediate",
         "offline_available": True,
         "available_models": [
-            {"id": "gemini-1.5-flash", "name": "Gemini 1.5 Flash (Fast, Recommended)"},
-            {"id": "gemini-1.5-pro", "name": "Gemini 1.5 Pro (Deep Reasoning)"},
-            {"id": "offline-extractive-v1", "name": "Offline Extractive Engine (TextRank + YAKE)"}
+            {"id": "gemini-3.5-flash-lite", "name": "Gemini 3.5 Flash Lite (Fast & Active Quota, Recommended)"},
+            {"id": "gemini-3.8-flash", "name": "Gemini 3.8 Flash (Latest Flagship)"},
+            {"id": "gemini-3.1-flash-lite", "name": "Gemini 3.1 Flash Lite"},
+            {"id": "offline-extractive-v1", "name": "Offline Extractive Engine (TextRank + YAKE - No API key needed)"}
         ]
     }
 

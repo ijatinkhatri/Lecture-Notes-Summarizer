@@ -14,6 +14,7 @@ from backend.app.prompts.templates import (
     PROMPT_A_DIRECT_SYSTEM, PROMPT_A_DIRECT_USER, render_prompt
 )
 from backend.app.providers.factory import ProviderFactory
+from backend.app.providers.offline_provider import OfflineProvider
 from backend.app.services.chunker import MapReduceChunker
 
 class SummarizerService:
@@ -67,43 +68,58 @@ class SummarizerService:
         # 3. Choose provider (Gemini or Offline)
         provider = ProviderFactory.get_provider(api_key=api_key)
         provider_type = "gemini" if ProviderFactory.is_gemini_active(api_key) else "offline"
-        model_name = request.model or ("gemini-1.5-flash" if provider_type == "gemini" else "offline-extractive-v1")
+        model_name = request.model or ("gemini-3.5-flash-lite" if provider_type == "gemini" else "offline-extractive-v1")
         temp = request.temperature or 0.2
 
         # 4. Check if map-reduce chunking is required
         total_words = len(sanitized_text.split())
         needs_map_reduce = MapReduceChunker.should_use_map_reduce(pages_data, total_words)
 
-        if needs_map_reduce and len(pages_data) > 1:
-            study_pkg = await self._run_map_reduce(
-                pages_data=pages_data,
-                title=doc_title,
-                target_words=target_words,
-                audience=request.audience_level,
-                language=request.language,
-                provider=provider,
-                temperature=temp,
-                model_name=model_name
-            )
-        else:
-            # Single-pass generation
-            variables = {
-                "title": doc_title,
-                "notes": format_data_boundary(sanitized_text),
-                "length": target_words,
-                "audience": request.audience_level,
-                "language": request.language,
-            }
-            # For primary summarizer, use Structured cognitive scaffold for highest quality
-            system_prompt = render_prompt(PROMPT_B_STRUCTURED_SYSTEM, variables)
-            user_prompt = render_prompt(PROMPT_B_STRUCTURED_USER, variables)
-            
-            study_pkg, _, _ = await provider.generate_study_package(
-                user_prompt=user_prompt,
-                system_prompt=system_prompt,
-                temperature=temp,
-                model_name=model_name
-            )
+        try:
+            if needs_map_reduce and len(pages_data) > 1:
+                study_pkg = await self._run_map_reduce(
+                    pages_data=pages_data,
+                    title=doc_title,
+                    target_words=target_words,
+                    audience=request.audience_level,
+                    language=request.language,
+                    provider=provider,
+                    temperature=temp,
+                    model_name=model_name
+                )
+            else:
+                # Single-pass generation
+                variables = {
+                    "title": doc_title,
+                    "notes": format_data_boundary(sanitized_text),
+                    "length": target_words,
+                    "audience": request.audience_level,
+                    "language": request.language,
+                }
+                # For primary summarizer, use Structured cognitive scaffold for highest quality
+                system_prompt = render_prompt(PROMPT_B_STRUCTURED_SYSTEM, variables)
+                user_prompt = render_prompt(PROMPT_B_STRUCTURED_USER, variables)
+                
+                study_pkg, _, _ = await provider.generate_study_package(
+                    user_prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    temperature=temp,
+                    model_name=model_name
+                )
+        except Exception as e:
+            if provider_type == "gemini":
+                # Resilient fallback to offline extractive engine so users are never blocked
+                offline_prov = OfflineProvider()
+                study_pkg, _, _ = await offline_prov.generate_study_package(
+                    user_prompt=sanitized_text,
+                    system_prompt="",
+                    temperature=temp,
+                    model_name="offline-extractive-v1"
+                )
+                provider_type = "offline"
+                model_name = "offline-extractive-v1"
+            else:
+                raise e
 
         # 5. Apply toggles
         if not request.generate_summary:

@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     
     # LLM Settings
     GEMINI_API_KEY: str = Field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
-    DEFAULT_MODEL: str = "gemini-1.5-flash"
+    DEFAULT_MODEL: str = "gemini-3.5-flash-lite"
     DEFAULT_TEMPERATURE: float = 0.2
     
     # Storage & Uploads

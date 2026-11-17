@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 from typing import Tuple, AsyncGenerator, Optional
@@ -22,14 +23,21 @@ class GeminiProvider(LLMProvider):
     def is_available(self) -> bool:
         return bool(self.api_key and len(self.api_key.strip()) > 5)
 
-    def _get_model(self, model_name: Optional[str] = None, system_instruction: Optional[str] = None) -> genai.GenerativeModel:
+    def _resolve_model_name(self, model_name: Optional[str] = None) -> str:
         name = model_name or settings.DEFAULT_MODEL
-        # Map common names
-        if name in ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash-exp"]:
-            target_name = name
-        else:
-            target_name = "gemini-1.5-flash"
-            
+        # Map legacy or deprecated names to modern active models
+        legacy_map = {
+            "gemini-1.5-flash": "gemini-3.5-flash-lite",
+            "gemini-1.5-pro": "gemini-3.8-flash",
+            "gemini-2.0-flash-exp": "gemini-3.5-flash-lite",
+            "gemini-2.5-flash": "gemini-3.5-flash-lite",
+            "gemini-2.5-flash-lite": "gemini-3.5-flash-lite",
+            "gemini-2.5-pro": "gemini-3.8-flash",
+        }
+        return legacy_map.get(name, name)
+
+    def _get_model(self, model_name: Optional[str] = None, system_instruction: Optional[str] = None) -> genai.GenerativeModel:
+        target_name = self._resolve_model_name(model_name)
         return genai.GenerativeModel(
             model_name=target_name,
             system_instruction=system_instruction
@@ -45,54 +53,70 @@ class GeminiProvider(LLMProvider):
         if not self.is_available():
             raise RuntimeError("Gemini API key is not configured.")
 
-        model = self._get_model(model_name, system_instruction=system_prompt)
+        primary_model = self._resolve_model_name(model_name)
+        candidate_models = [primary_model]
+        for fallback in ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash"]:
+            if fallback not in candidate_models:
+                candidate_models.append(fallback)
+
         start_time = time.time()
-        
-        gen_config = GenerationConfig(
-            temperature=temperature,
-            response_mime_type="application/json"
-        )
-        
-        # Attempt with automatic retry on malformed JSON
         last_error = None
-        for attempt in range(2):
-            try:
-                response = await model.generate_content_async(
-                    user_prompt,
-                    generation_config=gen_config
-                )
-                raw_text = response.text.strip()
-                
-                # Clean any markdown fences if present
-                if raw_text.startswith("```json"):
-                    raw_text = raw_text[7:]
-                if raw_text.startswith("```"):
-                    raw_text = raw_text[3:]
-                if raw_text.endswith("```"):
-                    raw_text = raw_text[:-3]
-                raw_text = raw_text.strip()
 
-                # Parse JSON into validated Pydantic model
-                data = json.loads(raw_text)
-                study_pkg = StudyPackageOutput.model_validate(data)
-                
-                latency_ms = round((time.time() - start_time) * 1000, 2)
-                
-                # Estimate token count
-                usage = getattr(response, "usage_metadata", None)
-                if usage and hasattr(usage, "total_token_count"):
-                    token_count = usage.total_token_count
-                else:
-                    token_count = int((len(user_prompt) + len(raw_text)) / 4)
+        for cur_model_name in candidate_models:
+            model = genai.GenerativeModel(
+                model_name=cur_model_name,
+                system_instruction=system_prompt
+            )
+            gen_config = GenerationConfig(
+                temperature=temperature,
+                response_mime_type="application/json"
+            )
+            
+            prompt_to_send = user_prompt
+            # Attempt up to 2 times for JSON malform retry
+            for attempt in range(2):
+                try:
+                    response = await asyncio.to_thread(
+                        model.generate_content,
+                        prompt_to_send,
+                        generation_config=gen_config
+                    )
+                    raw_text = response.text.strip()
                     
-                return study_pkg, latency_ms, token_count
+                    # Clean any markdown fences if present
+                    if raw_text.startswith("```json"):
+                        raw_text = raw_text[7:]
+                    if raw_text.startswith("```"):
+                        raw_text = raw_text[3:]
+                    if raw_text.endswith("```"):
+                        raw_text = raw_text[:-3]
+                    raw_text = raw_text.strip()
 
-            except Exception as e:
-                last_error = e
-                # Prepend error fix for retry
-                user_prompt += f"\n\n[ATTENTION]: Previous attempt failed with parsing error: {str(e)}. Strictly output raw valid JSON matching the exact schema."
+                    # Parse JSON into validated Pydantic model
+                    data = json.loads(raw_text)
+                    study_pkg = StudyPackageOutput.model_validate(data)
+                    
+                    latency_ms = round((time.time() - start_time) * 1000, 2)
+                    
+                    # Estimate token count
+                    usage = getattr(response, "usage_metadata", None)
+                    if usage and hasattr(usage, "total_token_count"):
+                        token_count = usage.total_token_count
+                    else:
+                        token_count = int((len(prompt_to_send) + len(raw_text)) / 4)
+                        
+                    return study_pkg, latency_ms, token_count
 
-        raise RuntimeError(f"Gemini generation failed after 2 attempts: {str(last_error)}")
+                except Exception as e:
+                    last_error = e
+                    err_msg = str(e)
+                    # If model not found or quota exhausted, break out of inner retry and try next candidate model
+                    if "404" in err_msg or "429" in err_msg or "ResourceExhausted" in err_msg or "NotFound" in err_msg:
+                        break
+                    # Otherwise retry once with prompt nudge
+                    prompt_to_send = user_prompt + f"\n\n[ATTENTION]: Previous attempt failed with parsing error: {err_msg}. Strictly output raw valid JSON matching the exact schema."
+
+        raise RuntimeError(f"Gemini generation failed: {str(last_error)}")
 
     async def evaluate_judge(
         self,
@@ -122,7 +146,11 @@ class GeminiProvider(LLMProvider):
         judge_prompt = render_prompt(LLM_JUDGE_USER, variables)
         
         try:
-            response = await model.generate_content_async(judge_prompt, generation_config=gen_config)
+            response = await asyncio.to_thread(
+                model.generate_content,
+                judge_prompt,
+                generation_config=gen_config
+            )
             raw = response.text.strip()
             if raw.startswith("```json"):
                 raw = raw[7:]

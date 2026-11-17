@@ -44,7 +44,7 @@ export const App: React.FC = () => {
   const [settings, setSettings] = useState<SettingsDTO>({
     has_gemini_api_key: false,
     gemini_api_key_masked: '',
-    active_model: 'gemini-1.5-flash',
+    active_model: 'gemini-3.5-flash-lite',
     temperature: 0.2,
     default_summary_mode: 'detailed',
     default_audience: 'intermediate',
